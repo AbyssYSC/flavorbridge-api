@@ -1,13 +1,7 @@
-﻿// api/pairing.js —— FlavorBridge 后端接口(部署在 Vercel)
-// 作用:接收 App 传来的食材/库存 → 调用 Claude → 返回严格 JSON
-// API key 从环境变量读,绝不进前端
-
+// api/pairing.js —— FlavorBridge 后端接口
 const Anthropic = require('@anthropic-ai/sdk');
-
-// 用环境变量里的密钥初始化(变量名要和 Vercel 后台设的一致)
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// 强制 Claude 按这个结构返回的"工具"定义,防止它乱说话
 const PAIRING_TOOL = {
   name: 'build_flavor_pairing',
   description: '根据食材风味轮廓,生成搭配的鸡尾酒或佐餐酒方案',
@@ -16,10 +10,7 @@ const PAIRING_TOOL = {
     properties: {
       flavor_profile: {
         type: 'object',
-        properties: {
-          sweet: { type: 'integer' }, sour: { type: 'integer' },
-          bitter: { type: 'integer' }, umami: { type: 'integer' }, fat: { type: 'integer' },
-        },
+        properties: { sweet: { type: 'integer' }, sour: { type: 'integer' }, bitter: { type: 'integer' }, umami: { type: 'integer' }, fat: { type: 'integer' } },
         required: ['sweet', 'sour', 'bitter', 'umami', 'fat'],
       },
       pairings: {
@@ -29,24 +20,10 @@ const PAIRING_TOOL = {
           properties: {
             name: { type: 'string' },
             type: { type: 'string', enum: ['cocktail', 'wine'] },
-            recipe: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: { ingredient: { type: 'string' }, amount: { type: 'string' } },
-                required: ['ingredient', 'amount'],
-              },
-            },
+            recipe: { type: 'array', items: { type: 'object', properties: { ingredient: { type: 'string' }, amount: { type: 'string' } }, required: ['ingredient', 'amount'] } },
             reason: { type: 'string' },
             uses_only_available: { type: 'boolean' },
-            substitutions: {
-              type: 'array',
-              items: {
-                type: 'object',
-                properties: { missing: { type: 'string' }, replace_with: { type: 'string' } },
-                required: ['missing', 'replace_with'],
-              },
-            },
+            substitutions: { type: 'array', items: { type: 'object', properties: { missing: { type: 'string' }, replace_with: { type: 'string' } }, required: ['missing', 'replace_with'] } },
           },
           required: ['name', 'type', 'recipe', 'reason', 'uses_only_available', 'substitutions'],
         },
@@ -56,55 +33,53 @@ const PAIRING_TOOL = {
   },
 };
 
-// Vercel 接口入口
-module.exports = async (req, res) => {
-  // 只允许 POST 请求
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: '只支持 POST' });
-  }
-
-  // 取出 App 传来的参数
-  const { target, targetType, availableItems } = req.body || {};
-  if (!target || !targetType) {
-    return res.status(400).json({ error: '缺少 target 或 targetType 参数' });
-  }
-
+async function callClaude(target, targetType, availableItems) {
   const itemsText = availableItems && availableItems.length ? availableItems.join('、') : '(未填写库存)';
   const userPrompt = [
     '用户选择的' + (targetType === 'spirit' ? '基酒' : '主菜食材') + '是:「' + target + '」。',
     '用户家里现有的库存是:' + itemsText + '。',
-    '请你:',
-    '1. 先分析「' + target + '」的风味轮廓(甜、酸、苦、鲜、脂肪感,各 1-10 分)。',
-    '2. 基于"风味桥梁理论",推荐正好 3 款搭配。',
-    '3. 优先使用用户已有库存。若缺关键辅料,必须在 substitutions 里给出平价替代。',
-    '4. 每个搭配都要写清楚搭配理由,从化学或味觉角度解释为何匹配。',
-    '务必通过 build_flavor_pairing 工具返回结果。',
+    '请分析其风味轮廓(甜酸苦鲜脂各1-10分),基于风味桥梁理论推荐正好3款搭配,优先用库存,缺辅料给平价替代,每个都写清搭配理由。务必通过工具返回。',
   ].join('\n');
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5',
+    max_tokens: 1500,
+    system: '你是精通风味科学与调酒的侍酒师。只能通过工具返回结构化结果,不要输出额外文字。',
+    tools: [PAIRING_TOOL],
+    tool_choice: { type: 'tool', name: 'build_flavor_pairing' },
+    messages: [{ role: 'user', content: userPrompt }],
+  });
+  const toolBlock = response.content.find((b) => b.type === 'tool_use');
+  return toolBlock ? toolBlock.input : null;
+}
 
+module.exports = async (req, res) => {
+  // 允许跨域(让浏览器测试工具也能调)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  // 浏览器直接打开(GET)= 测试模式,用固定数据调一次 Claude
+  if (req.method === 'GET') {
+    try {
+      const data = await callClaude('鸡胸肉', 'ingredient', ['柠檬', '蜂蜜', '薄荷']);
+      if (!data) return res.status(500).json({ error: 'AI 未返回预期数据' });
+      return res.status(200).json({ success: true, mode: 'test', data });
+    } catch (err) {
+      return res.status(500).json({ error: '调用失败', detail: String(err && err.message) });
+    }
+  }
+
+  // 正式请求(POST)
+  if (req.method !== 'POST') return res.status(405).json({ error: '只支持 POST' });
+  const { target, targetType, availableItems } = req.body || {};
+  if (!target || !targetType) return res.status(400).json({ error: '缺少 target 或 targetType 参数' });
   try {
-    // 调用 Claude
-    const response = await anthropic.messages.create({
-      model: 'claude-haiku-4-5',
-      max_tokens: 1500,
-      system: '你是一位精通风味科学与调酒的侍酒师。搭配必须基于真实味觉/化学原理,配方比例专业可执行。只能通过工具返回结构化结果,不要输出额外文字。',
-      tools: [PAIRING_TOOL],
-      tool_choice: { type: 'tool', name: 'build_flavor_pairing' },
-      messages: [{ role: 'user', content: userPrompt }],
-    });
-
-    // 取出工具调用结果(SDK 已解析成对象)
-    const toolBlock = response.content.find((b) => b.type === 'tool_use');
-    if (!toolBlock || !toolBlock.input) {
-      return res.status(500).json({ error: 'AI 未返回预期数据,请重试' });
-    }
-
-    // 返回给 App
-    return res.status(200).json({ success: true, data: toolBlock.input });
+    const data = await callClaude(target, targetType, availableItems);
+    if (!data) return res.status(500).json({ error: 'AI 未返回预期数据,请重试' });
+    return res.status(200).json({ success: true, data });
   } catch (err) {
-    console.error('Claude 调用失败:', err);
-    if (err.status === 429) {
-      return res.status(429).json({ error: '请求太频繁,请稍后再试' });
-    }
-    return res.status(500).json({ error: '生成搭配时出错,请稍后重试' });
+    if (err.status === 429) return res.status(429).json({ error: '请求太频繁,请稍后再试' });
+    return res.status(500).json({ error: '生成搭配时出错', detail: String(err && err.message) });
   }
 };
